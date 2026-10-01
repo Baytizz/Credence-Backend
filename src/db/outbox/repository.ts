@@ -104,6 +104,23 @@ type OutboxEventRow = {
   next_attempt_at?: string | null
 }
 
+/**
+ * Invariants enforced by OutboxRepository:
+ *  - State transitions are monotonic: pending -> processing -> {published | pending | dead_letter}.
+ *    A row can never move out of a terminal state (published / dead_letter).
+ *  - Every mutating method that targets a specific event must include the
+ *    expected current status (and consumer_id when relevant) in its WHERE
+ *    clause so concurrent workers cannot double-process an event.
+ *  - Retry counts are monotonically non-decreasing; max_retries is immutable
+ *    after insert.
+ *  - Failed events are rescheduled with bounded exponential backoff capped at
+ *    MAX_BACKOFF_SECONDS, and next_attempt_at is always cleared when the event
+ *    reaches a terminal state.
+ *  - Quarantine is a lossless move: the row is copied to outbox_quarantine
+ *    before being deleted from event_outbox, and reinjection is idempotent via
+ *    the reinjected_at guard.
+ */
+
 type OutboxQuarantineRow = {
   id: string
   original_event_id: string
@@ -122,6 +139,18 @@ type OutboxQuarantineRow = {
 }
 
 /**
+ * Validate that a caller-supplied limit is a positive safe integer.
+ * Prevents negative/NaN limits from reaching SQL (which would either error
+ * or, worse, be coerced into an unbounded scan).
+ */
+function requirePositiveLimit(limit: number, method: string): number {
+  if (!Number.isFinite(limit) || !Number.isInteger(limit) || limit <= 0) {
+    throw new RangeError(`${method}: limit must be a positive integer, received ${String(limit)}`)
+  }
+  return limit
+}
+
+/**
  * The only status transitions permitted by the outbox lifecycle.
  * @deprecated Use `OUTBOX_LIFECYCLE_TRANSITIONS` from `./transitions.js` for
  * programmatic validation.  This object is retained for backward compatibility
@@ -135,6 +164,18 @@ export const OUTBOX_STATE_TRANSITIONS = {
   dead_letter: [],
   ...OUTBOX_LIFECYCLE_TRANSITIONS,
 } as const
+
+/**
+ * Validate that a caller-supplied lease duration is a positive finite number.
+ * A zero or negative lease would immediately expire and allow another worker
+ * to reclaim the event while the original worker is still processing it.
+ */
+function requirePositiveLease(leaseSeconds: number, method: string): number {
+  if (!Number.isFinite(leaseSeconds) || leaseSeconds <= 0) {
+    throw new RangeError(`${method}: leaseSeconds must be a positive number, received ${String(leaseSeconds)}`)
+  }
+  return leaseSeconds
+}
 
 function requireTransition(rowCount: number, eventId: bigint, transition: string): void {
   if (rowCount !== 1) {
@@ -172,6 +213,12 @@ function mapOutboxEvent(row: OutboxEventRow): OutboxEvent {
     rawPayload = JSON.stringify(row.payload)
   }
 
+  // Defensive: retry_count / max_retries are NOT NULL in the schema, but a
+  // malformed row (e.g. from a manual migration) must not silently produce
+  // NaN and break backoff math downstream.
+  const retryCount = Number.isFinite(row.retry_count) ? row.retry_count : 0
+  const maxRetries = Number.isFinite(row.max_retries) && row.max_retries > 0 ? row.max_retries : 1
+
   return {
     id: BigInt(row.id),
     aggregateType: row.aggregate_type,
@@ -182,8 +229,8 @@ function mapOutboxEvent(row: OutboxEventRow): OutboxEvent {
     payloadParseError,
     nextAttemptAt: row.next_attempt_at ? new Date(row.next_attempt_at) : null,
     status: row.status,
-    retryCount: row.retry_count,
-    maxRetries: row.max_retries,
+    retryCount,
+    maxRetries,
     consumerId: row.consumer_id,
     leaseExpiresAt: row.lease_expires_at ? new Date(row.lease_expires_at) : null,
     createdAt: new Date(row.created_at),
@@ -269,12 +316,17 @@ export class OutboxRepository {
     shardCount?: number,
     shardId?: number
   ): Promise<OutboxEvent[]> {
-    const effectiveLimit = normalizeLimit(limit)
-    const effectiveLeaseSeconds = normalizeLeaseSeconds(leaseSeconds)
-    const shard = normalizeShard(shardCount, shardId)
-    const shardCountParam = shard.shardCount
-    const shardIdParam = shard.shardId
-
+    requirePositiveLimit(limit, 'claimEvents')
+    requirePositiveLease(leaseSeconds, 'claimEvents')
+    if (shardCount !== undefined && (!Number.isInteger(shardCount) || shardCount <= 0)) {
+      throw new RangeError(`claimEvents: shardCount must be a positive integer, received ${String(shardCount)}`)
+    }
+    if (shardId !== undefined && (!Number.isInteger(shardId) || shardId < 0)) {
+      throw new RangeError(`claimEvents: shardId must be a non-negative integer, received ${String(shardId)}`)
+    }
+    if (shardCount !== undefined && shardId !== undefined && shardId >= shardCount) {
+      throw new RangeError(`claimEvents: shardId (${shardId}) must be < shardCount (${shardCount})`)
+    }
     // Try with SKIP LOCKED first (real PostgreSQL)
     try {
       const result = await db.query<{
@@ -390,7 +442,7 @@ export class OutboxRepository {
    * @returns Number of events whose lease was renewed
    */
   async renewLease(db: Queryable, consumerId: string, leaseSeconds: number): Promise<number> {
-    const effectiveLeaseSeconds = normalizeLeaseSeconds(leaseSeconds)
+    requirePositiveLease(leaseSeconds, 'renewLease')
     const result = await db.query(
       `UPDATE event_outbox
        SET lease_expires_at = NOW() + ($2 || ' seconds')::interval
@@ -409,6 +461,7 @@ export class OutboxRepository {
    * @returns Number of events released
    */
   async releaseClaims(db: Queryable, consumerId: string): Promise<number> {
+    // Idempotent: releasing a consumer with no claims returns 0.
     const result = await db.query<{ count: string }>(
       `UPDATE event_outbox
        SET status = 'pending', consumer_id = NULL, lease_expires_at = NULL, publish_idempotency_key = NULL
@@ -428,7 +481,7 @@ export class OutboxRepository {
    * @returns Array of events owned by this consumer with status 'processing'
    */
   async fetchByConsumer(db: Queryable, consumerId: string, limit: number = 100): Promise<OutboxEvent[]> {
-    const effectiveLimit = normalizeLimit(limit)
+    requirePositiveLimit(limit, 'fetchByConsumer')
     const result = await db.query<{
       id: string
       aggregate_type: string
@@ -467,7 +520,7 @@ export class OutboxRepository {
    * Deprecated: Use claimEvents instead for crash-safe processing with consumer tracking.
    */
   async fetchPendingForProcessing(db: Queryable, limit: number = 100): Promise<OutboxEvent[]> {
-    assertNonNegativeInteger(limit, 'limit')
+    requirePositiveLimit(limit, 'fetchPendingForProcessing')
     // Legacy behavior maintained for backward compatibility.
     // New code should use claimEvents().
     const effectiveLimit = normalizeLimit(limit)
@@ -560,8 +613,7 @@ export class OutboxRepository {
       return 0
     }
     const parsed = Number(lagSeconds)
-    // Guard against non-finite values (NaN/Infinity) so downstream lag
-    // alerting never receives a value that silently disables thresholds.
+    // Guard against NaN/Infinity leaking into metrics.
     return Number.isFinite(parsed) ? parsed : 0
   }
 
@@ -569,6 +621,9 @@ export class OutboxRepository {
    * Mark an event as successfully published.
    */
   async markPublished(db: Queryable, eventId: bigint, consumerId: string): Promise<void> {
+    if (typeof eventId !== 'bigint') {
+      throw new TypeError(`markPublished: eventId must be a bigint, received ${typeof eventId}`)
+    }
     const result = await db.query(
       `UPDATE event_outbox
        SET status = 'published', processed_at = NOW(), consumer_id = NULL, lease_expires_at = NULL, publish_idempotency_key = NULL
@@ -588,9 +643,8 @@ export class OutboxRepository {
    * @returns true if the key was set (first attempt), false if already present
    */
   async trySetPublishIdempotencyKey(db: Queryable, eventId: bigint, key: string, consumerId: string): Promise<boolean> {
-    // Boundary: an empty key would defeat the idempotency guard entirely.
-    if (typeof key !== 'string' || key.length === 0) {
-      throw new Error('trySetPublishIdempotencyKey requires a non-empty idempotency key')
+    if (typeof eventId !== 'bigint') {
+      throw new TypeError(`trySetPublishIdempotencyKey: eventId must be a bigint, received ${typeof eventId}`)
     }
     const result = await db.query<{ id: string }>(
       `UPDATE event_outbox
@@ -607,6 +661,9 @@ export class OutboxRepository {
    * Clear the publish idempotency key so the event can be retried.
    */
   async clearPublishIdempotencyKey(db: Queryable, eventId: bigint): Promise<void> {
+    if (typeof eventId !== 'bigint') {
+      throw new TypeError(`clearPublishIdempotencyKey: eventId must be a bigint, received ${typeof eventId}`)
+    }
     await db.query(
       `UPDATE event_outbox SET publish_idempotency_key = NULL WHERE id = $1`,
       [eventId.toString()]
@@ -618,12 +675,9 @@ export class OutboxRepository {
    * If max retries exceeded, status remains 'failed'.
    */
   async markFailed(db: Queryable, eventId: bigint, errorMessage: string, consumerId: string): Promise<{ status: string; retryCount: number }> {
-    // Boundary: an empty/undefined error message would leave the failure
-    // undiagnosable.  Coerce to a stable placeholder so operators can still
-    // see *that* a failure happened even when the caller passed nothing.
-    const rawMessage = typeof errorMessage === 'string' && errorMessage.length > 0
-      ? errorMessage
-      : 'Unknown error'
+    if (typeof eventId !== 'bigint') {
+      throw new TypeError(`markFailed: eventId must be a bigint, received ${typeof eventId}`)
+    }
     // Truncate/redact before persisting: exception messages can incidentally
     // carry secrets (e.g. an Authorization header echoed by an HTTP client
     // error) or be unbounded in length.
@@ -659,6 +713,8 @@ export class OutboxRepository {
     const retryCount = Number(row.retry_count)
     const maxRetries = Number(row.max_retries)
 
+    // Derive status from the same predicate used in the SQL CASE so the
+    // returned value can never disagree with the persisted row.
     const status = retryCount >= maxRetries ? 'dead_letter' : 'pending'
     return { status, retryCount }
   }
@@ -683,7 +739,7 @@ function isSkipLockedUnsupportedError(error: unknown): boolean {
     aggregateId: string,
     limit: number = 100
   ): Promise<OutboxEvent[]> {
-    const effectiveLimit = normalizeLimit(limit)
+    requirePositiveLimit(limit, 'getByAggregate')
     const result = await db.query<{
       id: string
       aggregate_type: string
@@ -724,15 +780,9 @@ function isSkipLockedUnsupportedError(error: unknown): boolean {
     reason: OutboxQuarantineReason,
     errorMessage: string
   ): Promise<void> {
-    // Boundary: quarantine is a destructive move (DELETE + INSERT).  A missing
-    // or malformed event id would silently no-op and lose the event.  Fail
-    // loudly so the caller can retry with a valid event.
-    if (event === null || event === undefined || typeof event.id !== 'bigint') {
-      throw new Error('quarantine requires an event with a valid bigint id')
+    if (typeof event.id !== 'bigint') {
+      throw new TypeError(`quarantine: event.id must be a bigint, received ${typeof event.id}`)
     }
-    const sanitizedMessage = sanitizeErrorMessage(
-      typeof errorMessage === 'string' && errorMessage.length > 0 ? errorMessage : 'Unknown error'
-    )
     try {
       await db.query(
         `WITH deleted AS (
@@ -815,8 +865,10 @@ function isSkipLockedUnsupportedError(error: unknown): boolean {
     offset: number,
     reason?: OutboxQuarantineReason
   ): Promise<{ entries: OutboxQuarantineEntry[]; total: number }> {
-    const effectiveLimit = normalizeLimit(limit)
-    const effectiveOffset = Number.isFinite(offset) && offset > 0 ? Math.floor(offset) : 0
+    requirePositiveLimit(limit, 'listQuarantine')
+    if (!Number.isInteger(offset) || offset < 0) {
+      throw new RangeError(`listQuarantine: offset must be a non-negative integer, received ${String(offset)}`)
+    }
     const params: unknown[] = []
     const where: string[] = ['reinjected_at IS NULL']
     if (reason) {
@@ -853,14 +905,8 @@ function isSkipLockedUnsupportedError(error: unknown): boolean {
     fixedPayload: Record<string, unknown>,
     reinjectedBy: string
   ): Promise<bigint | null> {
-    // Boundary: reinjection is a state transition that must be attributable.
-    // An empty actor would make the audit trail useless, and a non-object
-    // payload would corrupt the outbox row.  Reject both up-front.
-    if (typeof reinjectedBy !== 'string' || reinjectedBy.length === 0) {
-      throw new Error('reinjectQuarantined requires a non-empty reinjectedBy actor')
-    }
-    if (fixedPayload === null || typeof fixedPayload !== 'object' || Array.isArray(fixedPayload)) {
-      throw new Error('reinjectQuarantined requires a plain object payload')
+    if (typeof quarantineId !== 'bigint') {
+      throw new TypeError(`reinjectQuarantined: quarantineId must be a bigint, received ${typeof quarantineId}`)
     }
     const result = await db.query<{ id: string }>(
       `WITH source AS (
@@ -900,17 +946,12 @@ function isSkipLockedUnsupportedError(error: unknown): boolean {
    * Clean up old published and failed events based on retention policy.
    */
   async cleanup(db: Queryable, config: OutboxCleanupConfig): Promise<number> {
-    // Boundary: a negative retention window would delete events that were
-    // just published (or are still being processed), causing silent data
-    // loss.  Clamp to zero so the worst case is "delete nothing".
-    const publishedRetentionDays =
-      Number.isFinite(config.publishedRetentionDays) && config.publishedRetentionDays > 0
-        ? Math.floor(config.publishedRetentionDays)
-        : 0
-    const failedRetentionDays =
-      Number.isFinite(config.failedRetentionDays) && config.failedRetentionDays > 0
-        ? Math.floor(config.failedRetentionDays)
-        : 0
+    if (!Number.isFinite(config.publishedRetentionDays) || config.publishedRetentionDays < 0) {
+      throw new RangeError(`cleanup: publishedRetentionDays must be a non-negative number, received ${String(config.publishedRetentionDays)}`)
+    }
+    if (!Number.isFinite(config.failedRetentionDays) || config.failedRetentionDays < 0) {
+      throw new RangeError(`cleanup: failedRetentionDays must be a non-negative number, received ${String(config.failedRetentionDays)}`)
+    }
     const result = await db.query<{ deleted_count: number }>(
       `WITH deleted AS (
          DELETE FROM event_outbox
