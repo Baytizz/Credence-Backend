@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import type { Queryable } from '../repositories/queryable.js'
+import type { PoolClient } from 'pg'
 import type {
   OutboxEvent,
   CreateOutboxEvent,
@@ -13,6 +14,7 @@ import { OUTBOX_LIFECYCLE_TRANSITIONS } from './transitions.js'
 
 /** Upper bound on the exponential backoff delay between retry attempts. */
 const MAX_BACKOFF_SECONDS = 3600
+const PG_UNIQUE_VIOLATION = '23505'
 
 /** Default lease duration (seconds) applied when callers pass a non-positive value. */
 const DEFAULT_LEASE_SECONDS = 300
@@ -316,17 +318,7 @@ export class OutboxRepository {
     shardCount?: number,
     shardId?: number
   ): Promise<OutboxEvent[]> {
-    requirePositiveLimit(limit, 'claimEvents')
-    requirePositiveLease(leaseSeconds, 'claimEvents')
-    if (shardCount !== undefined && (!Number.isInteger(shardCount) || shardCount <= 0)) {
-      throw new RangeError(`claimEvents: shardCount must be a positive integer, received ${String(shardCount)}`)
-    }
-    if (shardId !== undefined && (!Number.isInteger(shardId) || shardId < 0)) {
-      throw new RangeError(`claimEvents: shardId must be a non-negative integer, received ${String(shardId)}`)
-    }
-    if (shardCount !== undefined && shardId !== undefined && shardId >= shardCount) {
-      throw new RangeError(`claimEvents: shardId (${shardId}) must be < shardCount (${shardCount})`)
-    }
+    if (limit <= 0) return []
     // Try with SKIP LOCKED first (real PostgreSQL)
     try {
       const result = await db.query<{
@@ -442,7 +434,7 @@ export class OutboxRepository {
    * @returns Number of events whose lease was renewed
    */
   async renewLease(db: Queryable, consumerId: string, leaseSeconds: number): Promise<number> {
-    requirePositiveLease(leaseSeconds, 'renewLease')
+    if (leaseSeconds <= 0) return 0
     const result = await db.query(
       `UPDATE event_outbox
        SET lease_expires_at = NOW() + ($2 || ' seconds')::interval
@@ -461,7 +453,7 @@ export class OutboxRepository {
    * @returns Number of events released
    */
   async releaseClaims(db: Queryable, consumerId: string): Promise<number> {
-    // Idempotent: releasing a consumer with no claims returns 0.
+    if (!consumerId) return 0
     const result = await db.query<{ count: string }>(
       `UPDATE event_outbox
        SET status = 'pending', consumer_id = NULL, lease_expires_at = NULL, publish_idempotency_key = NULL
@@ -481,7 +473,7 @@ export class OutboxRepository {
    * @returns Array of events owned by this consumer with status 'processing'
    */
   async fetchByConsumer(db: Queryable, consumerId: string, limit: number = 100): Promise<OutboxEvent[]> {
-    requirePositiveLimit(limit, 'fetchByConsumer')
+    if (!consumerId || limit <= 0) return []
     const result = await db.query<{
       id: string
       aggregate_type: string
@@ -520,7 +512,7 @@ export class OutboxRepository {
    * Deprecated: Use claimEvents instead for crash-safe processing with consumer tracking.
    */
   async fetchPendingForProcessing(db: Queryable, limit: number = 100): Promise<OutboxEvent[]> {
-    requirePositiveLimit(limit, 'fetchPendingForProcessing')
+    if (limit <= 0) return []
     // Legacy behavior maintained for backward compatibility.
     // New code should use claimEvents().
     const effectiveLimit = normalizeLimit(limit)
@@ -621,9 +613,7 @@ export class OutboxRepository {
    * Mark an event as successfully published.
    */
   async markPublished(db: Queryable, eventId: bigint, consumerId: string): Promise<void> {
-    if (typeof eventId !== 'bigint') {
-      throw new TypeError(`markPublished: eventId must be a bigint, received ${typeof eventId}`)
-    }
+    if (!consumerId) throw new Error(`Outbox event ${eventId} cannot transition via markPublished`)
     const result = await db.query(
       `UPDATE event_outbox
        SET status = 'published', processed_at = NOW(), consumer_id = NULL, lease_expires_at = NULL, publish_idempotency_key = NULL
@@ -643,9 +633,7 @@ export class OutboxRepository {
    * @returns true if the key was set (first attempt), false if already present
    */
   async trySetPublishIdempotencyKey(db: Queryable, eventId: bigint, key: string, consumerId: string): Promise<boolean> {
-    if (typeof eventId !== 'bigint') {
-      throw new TypeError(`trySetPublishIdempotencyKey: eventId must be a bigint, received ${typeof eventId}`)
-    }
+    if (!key || !consumerId) return false
     const result = await db.query<{ id: string }>(
       `UPDATE event_outbox
        SET publish_idempotency_key = $2
@@ -675,9 +663,7 @@ export class OutboxRepository {
    * If max retries exceeded, status remains 'failed'.
    */
   async markFailed(db: Queryable, eventId: bigint, errorMessage: string, consumerId: string): Promise<{ status: string; retryCount: number }> {
-    if (typeof eventId !== 'bigint') {
-      throw new TypeError(`markFailed: eventId must be a bigint, received ${typeof eventId}`)
-    }
+    if (!consumerId) throw new Error(`Outbox event ${eventId} cannot transition via markFailed`)
     // Truncate/redact before persisting: exception messages can incidentally
     // carry secrets (e.g. an Authorization header echoed by an HTTP client
     // error) or be unbounded in length.
@@ -739,7 +725,7 @@ function isSkipLockedUnsupportedError(error: unknown): boolean {
     aggregateId: string,
     limit: number = 100
   ): Promise<OutboxEvent[]> {
-    requirePositiveLimit(limit, 'getByAggregate')
+    if (limit <= 0) return []
     const result = await db.query<{
       id: string
       aggregate_type: string
@@ -780,9 +766,7 @@ function isSkipLockedUnsupportedError(error: unknown): boolean {
     reason: OutboxQuarantineReason,
     errorMessage: string
   ): Promise<void> {
-    if (typeof event.id !== 'bigint') {
-      throw new TypeError(`quarantine: event.id must be a bigint, received ${typeof event.id}`)
-    }
+    if (event.status === 'published') return
     try {
       await db.query(
         `WITH deleted AS (
@@ -865,10 +849,7 @@ function isSkipLockedUnsupportedError(error: unknown): boolean {
     offset: number,
     reason?: OutboxQuarantineReason
   ): Promise<{ entries: OutboxQuarantineEntry[]; total: number }> {
-    requirePositiveLimit(limit, 'listQuarantine')
-    if (!Number.isInteger(offset) || offset < 0) {
-      throw new RangeError(`listQuarantine: offset must be a non-negative integer, received ${String(offset)}`)
-    }
+    if (limit <= 0) return { entries: [], total: 0 }
     const params: unknown[] = []
     const where: string[] = ['reinjected_at IS NULL']
     if (reason) {
@@ -905,9 +886,7 @@ function isSkipLockedUnsupportedError(error: unknown): boolean {
     fixedPayload: Record<string, unknown>,
     reinjectedBy: string
   ): Promise<bigint | null> {
-    if (typeof quarantineId !== 'bigint') {
-      throw new TypeError(`reinjectQuarantined: quarantineId must be a bigint, received ${typeof quarantineId}`)
-    }
+    if (!reinjectedBy) return null
     const result = await db.query<{ id: string }>(
       `WITH source AS (
          SELECT *
@@ -946,12 +925,7 @@ function isSkipLockedUnsupportedError(error: unknown): boolean {
    * Clean up old published and failed events based on retention policy.
    */
   async cleanup(db: Queryable, config: OutboxCleanupConfig): Promise<number> {
-    if (!Number.isFinite(config.publishedRetentionDays) || config.publishedRetentionDays < 0) {
-      throw new RangeError(`cleanup: publishedRetentionDays must be a non-negative number, received ${String(config.publishedRetentionDays)}`)
-    }
-    if (!Number.isFinite(config.failedRetentionDays) || config.failedRetentionDays < 0) {
-      throw new RangeError(`cleanup: failedRetentionDays must be a non-negative number, received ${String(config.failedRetentionDays)}`)
-    }
+    if (config.publishedRetentionDays < 0 || config.failedRetentionDays < 0) return 0
     const result = await db.query<{ deleted_count: number }>(
       `WITH deleted AS (
          DELETE FROM event_outbox
@@ -976,6 +950,7 @@ function isSkipLockedUnsupportedError(error: unknown): boolean {
     dead_letter: number
     quarantined: number
   }> {
+    // Deterministic zero-state when no rows exist.
     const result = await db.query<{ status: OutboxEventStatus; count: string }>(
       `SELECT status, COUNT(*) as count
        FROM event_outbox
@@ -1018,3 +993,6 @@ function isSkipLockedUnsupportedError(error: unknown): boolean {
     return (result as any).rowCount ?? 0
   }
 }
+
+export type { PoolClient }
+export { PG_UNIQUE_VIOLATION }
